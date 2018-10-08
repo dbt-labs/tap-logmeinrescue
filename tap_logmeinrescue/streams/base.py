@@ -104,6 +104,7 @@ class BaseLogMeInRescueReportStream(BaseLogMeInRescueStream):
         return header
 
     def get_stream_data(self, response):
+        # TODO: Looks like this is dropping the first row if not overriden
         status_removed = '\n'.join(response.splitlines()[2:])
         lines = status_removed.split('|\n')
         rows = lines[1:]

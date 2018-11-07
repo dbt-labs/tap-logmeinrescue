@@ -1,7 +1,9 @@
-import datetime
+from datetime import datetime, timedelta
 import funcy
 import pytz
 import singer
+from singer import utils
+import xml.etree.ElementTree as ET
 
 from dateutil.parser import parse
 
@@ -11,6 +13,48 @@ from tap_logmeinrescue.state import get_last_record_value_for_table, \
     incorporate, save_state
 
 from tap_logmeinrescue.logger import LOGGER
+
+def generate_date_windows(start_date, end_date=None):
+    """Yield 7 day windows from start_date to end_date.
+
+    Args:
+        start_date: A datetime object.
+        end_date: A datetime object > start_date. Defaults to utils.now()
+
+    With end_date as the default:
+    [x for x in generate_date_windows(
+                      utils.strptime_to_utc("2018-10-01T00:00:00Z"))]
+    [(datetime.datetime(2018, 10, 1, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 8, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 8, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 15, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 15, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 22, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 22, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 25, 16, 26, 10, 773289, tzinfo=<UTC>))]
+
+    With a passed end_date:
+    >>> [x for x in generate_date_windows(
+                      utils.strptime_to_utc("2018-10-01T00:00:00Z"),
+                      utils.strptime_to_utc("2018-10-25T00:00:00Z"))
+    [(datetime.datetime(2018, 10, 1, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 8, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 8, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 15, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 15, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 22, 0, 0, tzinfo=<UTC>)),
+     (datetime.datetime(2018, 10, 22, 0, 0, tzinfo=<UTC>),
+      datetime.datetime(2018, 10, 25, 0, 0, tzinfo=<UTC>))]"""
+    final_end_date = end_date if end_date else utils.now()
+    while True:
+        end_date = start_date + timedelta(days=7)
+        if end_date > final_end_date:
+            end_date = final_end_date
+            yield start_date, end_date
+            break
+        else:
+            yield start_date, end_date
+            start_date = end_date
 
 
 class BaseLogMeInRescueStream(BaseStream):
@@ -44,8 +88,8 @@ class BaseLogMeInRescueReportStream(BaseLogMeInRescueStream):
     def get_url(self):
         return 'https://secure.logmeinrescue.com/API/getReport_v2.aspx'
 
-    def generate_catalog(self, custom_field_schema={}):
-        schema = self.get_schema(custom_field_schema=custom_field_schema)
+    def generate_catalog(self, technician_id):
+        schema = self.get_schema(technician_id)
         mdata = singer.metadata.new()
 
         mdata = singer.metadata.write(
@@ -76,7 +120,9 @@ class BaseLogMeInRescueReportStream(BaseLogMeInRescueStream):
             'metadata': singer.metadata.to_list(mdata)
         }]
 
-    def get_schema(self, custom_field_schema={}):
+    def get_schema(self, technician_id):
+        custom_field_schema = self.header_to_string_schema(self.get_headers(technician_id))
+
         schema = self.load_schema_by_name(self.TABLE)
         schema['properties'] = funcy.merge(
             custom_field_schema,
@@ -84,127 +130,149 @@ class BaseLogMeInRescueReportStream(BaseLogMeInRescueStream):
 
         return schema
 
+
     def header_to_string_schema(self, header):
-        to_return = {}
+        return {self.convert_key(h): {"type": ["string", "null"]} for h in header}
 
-        for key in header:
-            new_key = self.convert_key(key)
-            to_return[new_key] = {
-                "type": ["string", "null"]
-            }
 
-        return to_return
+    def get_headers(self, technician_id):
+        start_date = get_config_start_date(self.config)
+        end_date = start_date + timedelta(days=7)
+        parsed_response = self.execute_request(technician_id, start_date, end_date)
+        return parsed_response['headers']
 
-    def get_header(self, response):
-        status_removed = '\n'.join(response.splitlines()[2:])
-        lines = status_removed.split('|\n')
-        header_line = lines[0]
-        header = header_line.split('|')
 
-        return header
+    def execute_request(self, parent_id, start_date, end_date):
+        # Sets the Report Type so that we generate a specific type of report
+        resp = self.client.make_request(
+            'https://secure.logmeinrescue.com/API/setReportArea_v8.aspx',
+            'POST',
+            params={'area': self.REPORT_AREA})
+        status = resp.split("\n\n", 1)[0]
+        if status != "OK":
+            raise Exception("Error with setReportArea request: {}".format(status))
 
-    def get_stream_data(self, response):
-        status_removed = '\n'.join(response.splitlines()[2:])
-        lines = status_removed.split('|\n')
-        rows = lines[1:]
-        header = self.get_header(response)
+        LOGGER.info(
+            ('Fetching session report for technician {}'
+             'from {} to {}')
+            .format(parent_id, start_date, end_date))
 
-        to_return = []
+        # Sets the start and end date on the report to be generated
+        report_dates = {'bdate': start_date.strftime('%-m/%-d/%Y %H:%M:%S'),
+                        'edate': end_date.strftime('%-m/%-d/%Y %H:%M:%S')}
+        resp = self.client.make_request(
+            'https://secure.logmeinrescue.com/API/setReportDate_v2.aspx',  # noqa
+            'POST',
+            params=report_dates)
+        status = resp.split("\n\n", 1)[0]
+        if status != "OK":
+            raise Exception("Error with setReportDate request: {}".format(status))
 
-        for row in rows:
-            to_add = {}
-            data = row.split('|')
+        # Set the report output to XML so that it can be
+        # parsed. Text output is buggy as it does not properly
+        # escape the field delimeter.
+        output_type = 'XML'
+        self.client.make_request(
+            'https://secure.logmeinrescue.com/API/setOutput.aspx',
+            'POST',
+            params={'output': output_type})
+        status = resp.split("\n\n", 1)[0]
+        if status != "OK":
+            raise Exception("Error with setOutput request: {}".format(status))
 
-            if len(data) != len(header):
-                continue
+        # Calls the generate report endpoint
+        report_params = {'node': parent_id,
+                         'nodetype': 'NODE'}
+        raw_response = self.client.make_request(
+            self.get_url(),
+            'GET',
+            params=report_params)
 
-            for index, item in enumerate(data):
-                to_add[header[index]] = item
+        # The response will contain a status followed by two newlines
+        status, data = raw_response.split("\n\n", 1)
 
-            to_return.append(self.transform_record(to_add))
+        if status != "OK":
+            msg = "Error retrieving report: {}\nReport Params: {}\nReport Dates: {}".format(status, report_params, report_dates)
+            raise Exception(msg)
 
-        return to_return
+        return self.parse_data(data)
 
-    def sync_data(self, parent_ids, return_first_response=False):
+
+    def sync_data(self, parent_ids):
         table = self.TABLE
 
-        if not return_first_response:
-            self.write_schema()
+        self.write_schema()
 
         start_date = get_last_record_value_for_table(
             self.state, table, 'start_date')
-        technician_id = get_last_record_value_for_table(
-            self.state, table, 'technician_id')
 
         if start_date is None:
             start_date = get_config_start_date(self.config)
         else:
             start_date = parse(start_date)
 
+        technician_id = get_last_record_value_for_table(
+            self.state, table, 'technician_id')
+
         if technician_id is None:
             technician_id = 0
 
-        end_date = start_date + datetime.timedelta(days=7)
-
-        self.client.make_request(
-            'https://secure.logmeinrescue.com/API/setReportArea_v8.aspx',
-            'POST',
-            params={'area': self.REPORT_AREA})
-
-        while start_date < datetime.datetime.now(tz=pytz.UTC):
+        for start_date, end_date in generate_date_windows(start_date):
             for index, parent_id in enumerate(parent_ids):
                 if parent_id < technician_id:
                     continue
 
                 LOGGER.info(
-                    ('Fetching session report for technician {} ({}/{}) '
-                     'from {} to {}')
-                    .format(parent_id, index + 1, len(parent_ids), start_date, end_date))
+                    'Fetching %s for technician %s (%s/%s) from %s to %s',
+                    table, parent_id, index + 1, len(parent_ids),
+                    start_date, end_date)
 
-                self.client.make_request(
-                    'https://secure.logmeinrescue.com/API/setReportDate_v2.aspx',  # noqa
-                    'POST',
-                    params={
-                        'bdate': start_date.strftime('%-m/%-d/%Y %-H:%M:%S'),
-                        'edate': end_date.strftime('%-m/%-d/%Y %-H:%M:%S')
-                    })
+                parsed_response = self.execute_request(parent_id, start_date, end_date)
 
-                response = self.client.make_request(
-                    self.get_url(),
-                    'GET',
-                    params={
-                        'node': parent_id,
-                        'nodetype': 'NODE',
-                    })
+                with singer.metrics.record_counter(endpoint=table) as ctr:
+                    singer.write_records(table, parsed_response['rows'])
 
-                if return_first_response:
-                    return response
+                    ctr.increment(amount=len(parsed_response['rows']))
 
-                to_write = self.get_stream_data(response)
+                # technician_id acts as a substream bookmark so that we
+                # can pick up in a single stream where we left off.
+                self.state = incorporate(
+                    self.state, table, 'technician_id', parent_id)
+                # There's no need to save `start_date` here. Even in the
+                # case of the first run the config start_date won't change
+                # so we're safe. It's acceptable to update start_date only
+                # after we're done the sync for this whole window.
+                save_state(self.state)
 
-                if not return_first_response:
-                    with singer.metrics.record_counter(endpoint=table) as ctr:
-                        singer.write_records(table, to_write)
-
-                        ctr.increment(amount=len(to_write))
-
-                    self.state = incorporate(
-                        self.state, table, 'technician_id', parent_id)
-                    self.state = incorporate(
-                        self.state, table, 'start_date', start_date)
-                    self.state = save_state(self.state)
-
-                elif len(to_write) > 0:
-                    return to_write[0]
-
-            start_date = end_date
-            end_date = start_date + datetime.timedelta(days=7)
             technician_id = 0
 
-            if not return_first_response:
-                self.state = incorporate(
-                    self.state, table, 'start_date', start_date)
-                self.state = incorporate(
-                    self.state, table, 'technician_id', technician_id,
-                    force=True)
-                self.state = save_state(self.state)
+            self.state = incorporate(
+                self.state, table, 'start_date', end_date)
+            # Because we go through all the technicians every time we sync
+            # we need to start over by resetting the technician_id sub
+            # bookmark to 0.
+            self.state = incorporate(
+                self.state, table, 'technician_id', 0, force=True)
+            save_state(self.state)
+
+
+    def parse_data(self, data):
+        tree = ET.fromstring(data)
+        headers = tree.find('header')
+
+        to_return = {}
+        rows = []
+
+        for row in tree.findall('./data/row'):
+            to_add = {}
+            for field in row.findall('field'):
+                header_id = field.attrib['id']
+                attrib_finder = "field[@id='{}']".format(header_id)
+                header_text = headers.find(attrib_finder).text
+                to_add[header_text] = field.text
+
+            rows.append(self.transform_record(to_add))
+
+        to_return['headers'] = [self.convert_key(e.text) for e in headers.findall('./field')]
+        to_return['rows'] = rows
+        return to_return

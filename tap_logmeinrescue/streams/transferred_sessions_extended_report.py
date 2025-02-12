@@ -1,5 +1,7 @@
+import re
 from tap_logmeinrescue.streams.base import BaseLogMeInRescueReportStream
 
+LINE_MATCHER = re.compile(r"\|\n(\d+\|(?:\n|.)+?)\|\n", re.MULTILINE)
 
 class TransferredSessionsExtendedReportStream(
     BaseLogMeInRescueReportStream
@@ -11,9 +13,9 @@ class TransferredSessionsExtendedReportStream(
     REQUIRES = ['technicians']
 
     def get_stream_data(self, response):
-        status_removed = '\n'.join(response.splitlines()[2:])
-        lines = status_removed.split('\n|\n')
-        header_line, rows = lines[0], lines[1:]
+        status_removed = re.sub("^OK\n\n", "", response)
+        header_line = status_removed[:status_removed.find('|\n')]
+        rows = LINE_MATCHER.findall(status_removed)
         header = header_line.split('|')
 
         to_return = []

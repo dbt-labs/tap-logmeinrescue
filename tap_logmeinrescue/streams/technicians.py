@@ -37,6 +37,10 @@ class TechniciansStream(BaseLogMeInRescueStream):
 
         response = self.client.make_request(self.get_url(), 'GET')
 
+        # In development, the fastest way to decrease iteration time is to
+        # slice the following data down to something very small like 10.
+        #
+        # all_technicians = self.get_stream_data(response)[:10]
         all_technicians = self.get_stream_data(response)
 
         if not return_ids:
@@ -60,3 +64,4 @@ class TechniciansStream(BaseLogMeInRescueStream):
             LOGGER.info("Syncing {}".format(substream.TABLE))
             substream.sync_data(
                 parent_ids=technician_ids)
+            self.state = substream.state

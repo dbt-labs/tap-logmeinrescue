@@ -36,17 +36,7 @@ class LogMeInRescueRunner(tap_framework.Runner):
         technician_ids = technicians_stream.sync_data(return_ids=True)
 
         for technicians_substream in technicians_substreams:
-            first_response = technicians_substream.sync_data(
-                parent_ids=technician_ids,
-                return_first_response=True
-            )
-
-            header = technicians_substream.get_header(first_response)
-            custom_field_schema = technicians_substream \
-                .header_to_string_schema(header)
-
-            catalog += technicians_substream.generate_catalog(
-                custom_field_schema)
+            catalog += technicians_substream.generate_catalog(technician_ids[0])
 
         json.dump({'streams': catalog}, sys.stdout, indent=4)
 
@@ -79,9 +69,9 @@ class LogMeInRescueRunner(tap_framework.Runner):
                             self.client)
 
                     else:
-                        technicians_substreams = [available_stream(
+                        technicians_substreams.append(available_stream(
                             self.config, self.state, stream_catalog,
-                            self.client)]
+                            self.client))
 
         if technicians_stream is not None:
             technicians_stream.substreams = technicians_substreams

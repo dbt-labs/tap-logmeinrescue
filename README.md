@@ -50,4 +50,4 @@ tap-logmeinrescue -c config.json --properties catalog.json
 
 ---
 
-Copyright &copy; 2018 Fishtown Analytics
+Copyright &copy; 2018 Stitch

@@ -48,6 +48,8 @@ def save_state(state):
 
     LOGGER.info('Updating state.')
 
+    LOGGER.debug('%s', state)
+
     singer.write_state(state)
 
 
